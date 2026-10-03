@@ -30,7 +30,18 @@ func (s *Server) NewRouter() http.Handler {
 	mux.HandleFunc("POST /v1/snapshots/{id}/verify", s.verify)
 	mux.HandleFunc("GET /v1/snapshots/{id}/errors", s.listErrors)
 	mux.HandleFunc("GET /v1/snapshots/{id}/missing", s.missing)
+	mux.HandleFunc("GET /v1/snapshots/{id}/chunks", s.snapshotChunks)
 	mux.HandleFunc("POST /v1/snapshots/{id}/restore", s.restore)
+
+	// Repository-wide integrity patrol.
+	mux.HandleFunc("POST /v1/scrubs", s.startScrub)
+	mux.HandleFunc("POST /v1/scrubs/interrupt", s.interruptScrub)
+	mux.HandleFunc("GET /v1/scrubs/latest", s.latestScrub)
+	mux.HandleFunc("GET /v1/scrubs/latest/snapshots/{sid}", s.latestScrubSnapshot)
+	mux.HandleFunc("GET /v1/scrubs/latest/chunks/{digest}/affected", s.latestChunkAffected)
+	mux.HandleFunc("GET /v1/scrubs/{id}", s.getScrub)
+	mux.HandleFunc("GET /v1/scrubs/{id}/snapshots/{sid}", s.getScrubSnapshot)
+	mux.HandleFunc("GET /v1/scrubs/{id}/chunks/{digest}/affected", s.chunkAffected)
 	return mux
 }
 
@@ -55,18 +66,20 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 type snapshotResp struct {
-	ID          int64      `json:"id"`
-	RootPath    string     `json:"root_path"`
-	Status      string     `json:"status"`
-	FileCount   int64      `json:"file_count"`
-	DirCount    int64      `json:"dir_count"`
-	BytesTotal  int64      `json:"bytes_total"`
-	ChunksNew   int64      `json:"chunks_new"`
-	ChunksRef   int64      `json:"chunks_referenced"`
-	Polynomial  string     `json:"polynomial"`
-	CreatedAt   time.Time  `json:"created_at"`
-	CommittedAt *time.Time `json:"committed_at,omitempty"`
-	Message     string     `json:"message"`
+	ID             int64      `json:"id"`
+	RootPath       string     `json:"root_path"`
+	Status         string     `json:"status"`
+	Integrity      string     `json:"integrity"`
+	IntegrityRunID int64      `json:"integrity_run_id,omitempty"`
+	FileCount      int64      `json:"file_count"`
+	DirCount       int64      `json:"dir_count"`
+	BytesTotal     int64      `json:"bytes_total"`
+	ChunksNew      int64      `json:"chunks_new"`
+	ChunksRef      int64      `json:"chunks_referenced"`
+	Polynomial     string     `json:"polynomial"`
+	CreatedAt      time.Time  `json:"created_at"`
+	CommittedAt    *time.Time `json:"committed_at,omitempty"`
+	Message        string     `json:"message"`
 }
 
 func toSnapshotResp(si repo.SnapshotInfo) snapshotResp {
@@ -74,6 +87,7 @@ func toSnapshotResp(si repo.SnapshotInfo) snapshotResp {
 		ID:          si.ID,
 		RootPath:    si.RootPath,
 		Status:      si.Status,
+		Integrity:   repo.IntegrityUnscanned, // replaced with latest patrol verdict below when available
 		FileCount:   si.FileCount,
 		DirCount:    si.DirCount,
 		BytesTotal:  si.BytesTotal,
@@ -92,11 +106,37 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
 		return
 	}
+	verdicts := s.latestIntegrityMap()
 	out := make([]snapshotResp, 0, len(all))
 	for _, si := range all {
-		out = append(out, toSnapshotResp(si))
+		resp := toSnapshotResp(si)
+		if v, ok := verdicts[si.ID]; ok {
+			resp.Integrity = v.Integrity
+			resp.IntegrityRunID = v.RunID
+		}
+		out = append(out, resp)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": out})
+}
+
+// integrityView is the latest patrol verdict of one snapshot.
+type integrityView struct {
+	RunID     int64
+	Integrity string
+}
+
+// latestIntegrityMap returns snapshot id -> latest patrol verdict. When no
+// patrol ever ran, every snapshot stays "unscanned".
+func (s *Server) latestIntegrityMap() map[int64]integrityView {
+	prog, err := s.Engine.LatestScrubProgress()
+	if err != nil || prog == nil {
+		return nil
+	}
+	out := make(map[int64]integrityView, len(prog.Snapshots))
+	for _, v := range prog.Snapshots {
+		out[v.SnapshotID] = integrityView{RunID: prog.RunID, Integrity: v.Integrity}
+	}
+	return out
 }
 
 type createReq struct {
@@ -160,12 +200,16 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 }
 
 func parseID(w http.ResponseWriter, r *http.Request) (int64, bool) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	id, err := parseInt64(r.PathValue("id"))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "bad_id", "snapshot id must be an integer", nil)
 		return 0, false
 	}
 	return id, true
+}
+
+func parseInt64(s string) (int64, error) {
+	return strconv.ParseInt(s, 10, 64)
 }
 
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
@@ -182,7 +226,12 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
 		return
 	}
-	writeJSON(w, http.StatusOK, toSnapshotResp(si))
+	resp := toSnapshotResp(si)
+	if v, ok := s.latestIntegrityMap()[id]; ok {
+		resp.Integrity = v.Integrity
+		resp.IntegrityRunID = v.RunID
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) verify(w http.ResponseWriter, r *http.Request) {
@@ -262,6 +311,42 @@ func (s *Server) missing(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, missingResp{SnapshotID: id, Status: si.Status, Missing: items})
 }
 
+// GET /v1/snapshots/{id}/chunks — maintenance listing: every content chunk
+// referenced by the snapshot with the file path(s) using it.
+func (s *Server) snapshotChunks(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	if _, err := s.Engine.Manifest.GetSnapshot(id); errors.Is(err, repo.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "not_found", "snapshot does not exist", nil)
+		return
+	} else if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	refs, err := s.Engine.Manifest.ChunkReferencesOfSnapshot(id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	type item struct {
+		Digest   string `json:"chunk_digest"`
+		Length   int64  `json:"declared_length"`
+		RelPath  string `json:"rel_path"`
+		BlobPath string `json:"expected_blob_path"`
+	}
+	out := make([]item, 0, len(refs))
+	for _, ci := range refs {
+		it := item{Digest: hex.EncodeToString(ci.Digest), Length: ci.Length, RelPath: ci.RelPath}
+		if p, err := s.Engine.Store.Path(ci.Digest); err == nil {
+			it.BlobPath = p
+		}
+		out = append(out, it)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"snapshot_id": id, "chunks": out})
+}
+
 func (s *Server) listErrors(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseID(w, r)
 	if !ok {
@@ -310,6 +395,31 @@ func (s *Server) restore(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.Engine.Restore(id, req.Target)
 	if err != nil {
+		var suspect *backup.ScrubSuspectError
+		if errors.As(err, &suspect) {
+			items := make([]map[string]any, 0, len(suspect.Bad))
+			for _, bc := range suspect.Bad {
+				item := map[string]any{
+					"chunk_digest":    hex.EncodeToString(bc.Digest),
+					"declared_length": bc.Length,
+					"reason":          bc.Result,
+					"rel_paths":       bc.RelPaths,
+				}
+				if p, perr := s.Engine.Store.Path(bc.Digest); perr == nil {
+					item["expected_blob_path"] = p
+				}
+				items = append(items, item)
+			}
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":           "snapshot_suspect",
+				"message":         err.Error(),
+				"snapshot_id":     suspect.SnapshotID,
+				"scrub_run_id":    suspect.RunID,
+				"affected_chunks": items,
+				"hint":            "GET /v1/scrubs/latest/snapshots/" + strconv.FormatInt(suspect.SnapshotID, 10),
+			})
+			return
+		}
 		if errors.Is(err, backup.ErrTargetExists) {
 			writeErr(w, http.StatusConflict, "target_exists", err.Error(), nil)
 			return

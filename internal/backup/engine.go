@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -29,6 +30,11 @@ type Failpoints struct {
 	// blob files from the content store before verification runs,
 	// simulating a crash/loss during commit finalization.
 	LoseChunkCount int
+	// ScrubAfterChunk, when set, is invoked after each chunk of a patrol is
+	// scanned. Returning an error stops the patrol as if interrupted
+	// (progress stays checkpointed so it can be resumed). Tests use it to
+	// kill a run at a deterministic cursor.
+	ScrubAfterChunk func(runID int64, scanned int64) error
 }
 
 // Engine ties the manifest and content store together.
@@ -39,6 +45,10 @@ type Engine struct {
 	Fail     Failpoints
 
 	mu sync.Mutex // serializes snapshots: scan + commit is one critical section
+
+	scrubMu     sync.Mutex
+	scrubCancel context.CancelFunc // non-nil while a patrol runs in-process
+	scrubRunID  int64
 }
 
 // NewEngine opens an engine, loading the repository's chunking polynomial
@@ -297,6 +307,11 @@ func (e *Engine) Restore(snapshotID int64, target string) (*RestoreResult, error
 	if info.Status != repo.StatusCommitted {
 		return nil, fmt.Errorf("snapshot %d is %s, only committed snapshots can be restored",
 			snapshotID, info.Status)
+	}
+	// Refuse early, with locatable chunk paths, when the latest patrol has
+	// already proved a referenced block corrupt or missing.
+	if err := e.checkScrubGate(snapshotID); err != nil {
+		return nil, err
 	}
 
 	target, err = filepath.Abs(filepath.FromSlash(target))

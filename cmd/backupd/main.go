@@ -56,6 +56,15 @@ func main() {
 		}
 	}
 
+	// An interrupted integrity patrol stays 'running' in SQLite with its
+	// stable cursor; resume it from there instead of starting a duplicate.
+	if prog, resumed, err := engine.ResumeInterruptedScrub(); err != nil {
+		log.Printf("startup scrub resume: %v", err)
+	} else if resumed && prog != nil {
+		log.Printf("startup scrub resume: run %d continued from cursor (%d/%d chunks)",
+			prog.RunID, prog.ScannedChunks, prog.TotalChunks)
+	}
+
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatalf("listen %s: %v", *addr, err)

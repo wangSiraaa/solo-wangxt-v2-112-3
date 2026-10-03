@@ -181,6 +181,37 @@ func (m *Manifest) ReferencedChunks(id int64) ([]ChunkRef, error) {
 	return out, rows.Err()
 }
 
+// SnapshotChunkInfo describes one chunk referenced by a snapshot and every
+// file path of the snapshot that uses it. It backs the maintenance listing
+// that precedes an affected-paths query.
+type SnapshotChunkInfo struct {
+	Digest  []byte
+	Length  int64
+	RelPath string
+}
+
+// ChunkReferencesOfSnapshot lists (chunk, file path) pairs of a snapshot,
+// deduplicated per chunk+path, ordered by digest and path.
+func (m *Manifest) ChunkReferencesOfSnapshot(id int64) ([]SnapshotChunkInfo, error) {
+	rows, err := m.db.Query(`SELECT DISTINCT c.digest, c.length, ec.rel_path
+		FROM entry_chunks ec JOIN chunks c ON c.digest = ec.chunk_digest
+		WHERE ec.snapshot_id = ?
+		ORDER BY c.digest, ec.rel_path`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SnapshotChunkInfo
+	for rows.Next() {
+		var ci SnapshotChunkInfo
+		if err := rows.Scan(&ci.Digest, &ci.Length, &ci.RelPath); err != nil {
+			return nil, err
+		}
+		out = append(out, ci)
+	}
+	return out, rows.Err()
+}
+
 // MissingChunk is a reference that cannot currently be satisfied from the
 // content store: either the chunk row is missing from the catalog, or the
 // blob file is absent / has the wrong length.

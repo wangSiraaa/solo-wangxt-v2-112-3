@@ -120,6 +120,64 @@ CREATE TABLE IF NOT EXISTS meta (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 );
+
+-- Integrity patrol ("scrub") runs. A run freezes a high-watermark snapshot id
+-- at start: only snapshots that existed then are in scope, and their verdict
+-- is stored separately from snapshots.status. The historical commit fact
+-- (pending/committed/failed) is never rewritten by a patrol.
+CREATE TABLE IF NOT EXISTS scrub_runs (
+	id             INTEGER PRIMARY KEY AUTOINCREMENT,
+	high_watermark INTEGER NOT NULL,            -- max(snapshots.id) at start
+	status         TEXT    NOT NULL,            -- 'running' | 'done'
+	cursor_digest  BLOB,                        -- last processed chunk (stable digest order)
+	total_chunks   INTEGER NOT NULL DEFAULT 0,  -- frozen size of scrub_work
+	clean_chunks   INTEGER NOT NULL DEFAULT 0,
+	bad_chunks     INTEGER NOT NULL DEFAULT 0,
+	started_at     TEXT    NOT NULL,
+	finished_at    TEXT
+);
+
+-- Frozen work set of one run: distinct chunks referenced by any snapshot at or
+-- below the high-watermark. Materialized at start so snapshots committing
+-- later can neither enlarge the run nor get retroactively marked checked.
+CREATE TABLE IF NOT EXISTS scrub_work (
+	run_id          INTEGER NOT NULL REFERENCES scrub_runs(id) ON DELETE CASCADE,
+	chunk_digest    BLOB    NOT NULL,
+	declared_length INTEGER NOT NULL,           -- chunks.length at start, -1 when the catalog row is gone
+	PRIMARY KEY (run_id, chunk_digest)
+);
+
+-- Per-chunk streaming verdict. Exactly one row per (run, chunk); resume uses
+-- INSERT OR IGNORE so an interrupted run never produces a duplicate report.
+CREATE TABLE IF NOT EXISTS scrub_chunks (
+	run_id          INTEGER NOT NULL REFERENCES scrub_runs(id) ON DELETE CASCADE,
+	chunk_digest    BLOB    NOT NULL,
+	declared_length INTEGER NOT NULL,
+	result          TEXT    NOT NULL,           -- ok | missing_catalog | missing_blob | length_mismatch | digest_mismatch | read_error
+	actual_length   INTEGER NOT NULL DEFAULT -1,
+	message         TEXT    NOT NULL DEFAULT '',
+	scanned_at      TEXT    NOT NULL,
+	PRIMARY KEY (run_id, chunk_digest)
+);
+CREATE INDEX IF NOT EXISTS idx_scrub_chunks_digest ON scrub_chunks(chunk_digest);
+
+-- Per-snapshot patrol verdict, independent of snapshots.status:
+--   clean     - committed at start, every referenced chunk verified
+--   suspect   - committed at start, at least one referenced chunk is bad
+--   unscanned - in scope, run not finished yet (never persisted as clean early)
+--   excluded  - pending/failed at start: commit status and errors stay authoritative
+--   uncovered - snapshot id above the watermark: this run does not cover it
+CREATE TABLE IF NOT EXISTS scrub_snapshots (
+	run_id           INTEGER NOT NULL REFERENCES scrub_runs(id) ON DELETE CASCADE,
+	snapshot_id      INTEGER NOT NULL,
+	covered          INTEGER NOT NULL,          -- 1 = existed at start, 0 = appeared afterwards
+	integrity        TEXT    NOT NULL,
+	note             TEXT    NOT NULL DEFAULT '',
+	bad_chunk_count  INTEGER NOT NULL DEFAULT 0,
+	updated_at       TEXT    NOT NULL,
+	PRIMARY KEY (run_id, snapshot_id)
+);
+CREATE INDEX IF NOT EXISTS idx_scrub_snap_snapshot ON scrub_snapshots(snapshot_id);
 `
 
 func (m *Manifest) migrate() error {

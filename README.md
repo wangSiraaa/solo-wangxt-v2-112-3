@@ -27,13 +27,16 @@ cmd/demo/main.go             端到端演示（走真实 HTTP API，含 23 项�
 internal/repo/
   contentstore.go            内容寻址块仓（原子写、读时校验摘要、分片目录）
   manifest.go                SQLite schema 与快照状态机（pending/committed/failed）
-  manifest_write.go          条目/块写入、缺块诊断查询
+  manifest_write.go          条目/块写入、缺块诊断查询、快照引用块清单
+  scrub.go                   巡检作业：水位/冻结工作集/游标/每块结果/每快照结论的持久化
   meta.go                    分块多项式持久化
 internal/backup/
   scan.go                    不跟随链接的目录扫描、分块、整文件摘要、写入中重读
   engine.go                  快照编排、提交前逐块验证、恢复与全部安全约束
+  scrub.go                   可中断续扫的流式巡检执行器、suspect 恢复预检
   util_linux.go              O_EXCL|O_NOFOLLOW 建文件（阻止沿预置符号链接写出）
-internal/api/server.go       HTTP 路由
+internal/api/server.go       HTTP 路由（快照/恢复）
+internal/api/scrub.go        HTTP 路由（巡检启动/进度/按快照/受影响路径）
 ```
 
 ## 快速开始
@@ -55,7 +58,14 @@ go run ./cmd/backupd --repo ./backup-repo --addr 127.0.0.1:8090
 | `GET  /v1/snapshots/{id}/errors` | 扫描/验证阶段的逐条错误（stage、rel_path、chunk_digest） |
 | `POST /v1/snapshots/{id}/verify` | 对 pending 快照重新执行逐块验证并提交/判失败 |
 | `POST /v1/snapshots/{id}/restore` | 恢复到**全新**目录，返回逐文件长度+摘要+块数报告 |
+| `GET  /v1/snapshots/{id}/chunks` | 维护入口：列出快照引用的每个块及使用它的文件路径 |
 | `POST /v1/recover` | 复验所有 pending 快照（服务启动时也会自动执行） |
+| `POST /v1/scrubs` | **启动全仓完整性巡检**（已中断则从稳定游标续扫；可选 `throttle_ms` / `gate_ms`） |
+| `POST /v1/scrubs/interrupt` | 请求中断当前巡检（已检结果与游标保留） |
+| `GET  /v1/scrubs/latest` | 最近一次巡检的进度：水位、游标、块计数、逐快照状态汇总 |
+| `GET  /v1/scrubs/{id}` | 指定巡检作业的进度 |
+| `GET  /v1/scrubs/latest/snapshots/{sid}` | **按快照查询独立完整性状态**（可用 `{id}` 换具体作业） |
+| `GET  /v1/scrubs/latest/chunks/{digest}/affected` | **受影响路径反查**：列出引用某块的全部快照与文件路径 |
 
 ### 典型请求
 
@@ -73,6 +83,13 @@ curl -s localhost:8090/v1/snapshots/7/missing
 
 curl -s -XPOST localhost:8090/v1/snapshots/7/restore \
   -d '{"target":"/restore/2026-09-29"}'
+
+# 启动全仓完整性巡检（异步），随后查看进度与某快照结论
+curl -s -XPOST localhost:8090/v1/scrubs -d '{}'
+curl -s localhost:8090/v1/scrubs/latest
+curl -s localhost:8090/v1/scrubs/latest/snapshots/7
+# 某个坏块影响了哪些快照和文件？
+curl -s localhost:8090/v1/scrubs/latest/chunks/<64位hex摘要>/affected
 ```
 
 ## 关键正确性保证
@@ -91,6 +108,36 @@ curl -s -XPOST localhost:8090/v1/snapshots/7/restore \
 6. **空文件**：长度 0、整文件摘要 `e3b0c442…`、0 个内容块，正常备份与恢复。
 7. **失败可定位**：failed/pending 快照永久保留，`/missing` 直接给出“哪个文件的哪个块该在哪个路径”，
    而不是只看到队列空了。
+8. **可恢复的全仓完整性巡检**：见下节，主动发现磁盘静默损坏，而不是等恢复失败。
+
+## 全仓完整性巡检（scrub）
+
+提交成功只代表当时逐块验证通过；磁盘上的 blob 之后可能被篡改或静默损坏。巡检作业主动扫描
+**全部快照共享的去重内容仓**，在 SQLite 中持久化四类状态：
+
+| 表 | 内容 |
+|---|---|
+| `scrub_runs` | 每次巡检：**开始水位**（启动时 `max(snapshots.id)`）、**稳定游标**（最后处理完的块摘要）、块计数、状态 |
+| `scrub_work` | 启动瞬间冻结的工作集（水位内快照引用的去重块 + 当时清单声明长度），之后提交的快照不能扩大它 |
+| `scrub_chunks` | **每块的流式摘要结果**：`ok / missing_catalog / missing_blob / length_mismatch / digest_mismatch / read_error` |
+| `scrub_snapshots` | **每个快照独立的完整性状态**：`clean / suspect / unscanned / excluded / uncovered` |
+
+关键规则：
+
+- **历史不被改写**：`snapshots.status`（pending/committed/failed）仍是当时的提交事实；
+  巡检结论存在独立的 `integrity` 字段，快照列表同时返回两者。
+- **独立完整性状态**：`clean` = 水位内已提交且引用块全部复核通过；`suspect` = 有坏块；
+  `unscanned` = 巡检未结束、尚未扫到（**绝不会因为扫了一半就显示 clean**）；
+  `excluded` = 启动时还是 pending/failed（提交状态与 `snapshot_errors` 原故障记录保持权威）；
+  `uncovered` = 水位之后才提交的快照，明确标为未覆盖。
+- **共享块反查**：一个共享 blob 不符时，`…/chunks/{digest}/affected` 经清单反查，
+  列出**所有受影响快照和文件路径**（一个块可能出现在多个快照的多个文件里）。
+- **可中断、可续扫、不重复**：每批结果与游标在同一事务落盘；中断后再次 `POST /v1/scrubs`
+  复用同一作业（返回 `200 resumed`，不生成重复报告），`INSERT OR IGNORE` 保证不重复记录；
+  daemon 重启时自动从游标续扫。续扫结果与一次完整巡检逐块一致。
+- **恢复前预检**：已知 `suspect` 的快照调用恢复会在流式读取**之前**被拒绝
+  （`409 snapshot_suspect`），错误直接给出坏块摘要、`rel_paths` 和期望磁盘路径；
+  未被巡检覆盖的块仍由恢复时的逐块流式 SHA-256 校验兜底。
 
 ## 演示会依次证明
 
@@ -101,3 +148,8 @@ curl -s -XPOST localhost:8090/v1/snapshots/7/restore \
 5. `lose_chunks:1` 模拟提交中断 → `failed` + `/missing` 给出精确缺块，旧快照仍可恢复；
 6. 指向根目录外的符号链接 → 恢复 `422`，半成品目录回滚，外部文件不被触及；
 7. `finish:false` 制造 pending → 重启服务后自动复验为 committed。
+8. **巡检**：健康基线 clean → 静默损坏两个快照共享的块 → 两者均 suspect、清单反查列出全部
+   快照与路径、恢复被提前拒绝；唯一块损坏只影响所属快照；巡检中断在第一个块前后续扫，
+   结果与完整巡检一致且不重复报告。
+9. **水位**：巡检期间新建的快照标为 uncovered（不假装已检查），下一次巡检才覆盖；
+   既有 failed 快照始终 excluded，故障记录不丢失。

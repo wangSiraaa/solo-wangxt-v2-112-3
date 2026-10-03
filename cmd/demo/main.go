@@ -8,7 +8,12 @@
 //  5. commit interruption losing a blob -> failed snapshot with the exact
 //     missing chunk located,
 //  6. symlink escaping the root -> restored link is blocked,
-//  7. server restart with a pending snapshot -> startup recovery commits it.
+//  7. server restart with a pending snapshot -> startup recovery commits it,
+//  8. repository-wide integrity patrol: clean baseline, silent corruption of
+//     a shared blob -> every referencing snapshot suspect with file paths,
+//     restore refused early,
+//  9. patrol high-watermark: a snapshot born after the start is "uncovered"
+//     (never faked clean), a later patrol covers it.
 package main
 
 import (
@@ -274,13 +279,272 @@ func main() {
 	fmt.Printf("  重启后: 快照 %d status=%s\n", pendID, si["status"])
 	check("重启恢复把 pending 快照验证后提交为 committed", si["status"] == "committed")
 
+	// ---- 8. integrity patrol: silent rot of a shared blob ---------------
+	section(8, "全仓完整性巡检：静默损坏一个被多个快照共享的块 → 全部受影响快照标 suspect 并提前拒绝恢复")
+	// Snapshot the current tree once more so a stable chunk is shared by at
+	// least two committed snapshots (#1/#2 share most of app.log; make sure
+	// we target a chunk they genuinely share).
+	scrubBase := post(srv.URL+"/v1/snapshots", map[string]any{"root": src, "message": "patrol baseline"})
+	patrolID := int64(scrubBase["snapshot_id"].(float64))
+	check("巡检基线快照 committed", scrubBase["status"] == "committed")
+
+	// 8a. first patrol over healthy storage
+	code, body = raw("POST", srv.URL+"/v1/scrubs", map[string]any{})
+	check("启动巡检返回 201（新巡检作业）", code == http.StatusCreated && body["action"] == "started")
+	firstScrub := waitScrub(srv.URL)
+	check("巡检作业最终状态 done", firstScrub["status"] == "done")
+	check("巡检在 SQLite 中记录了开始水位 high_watermark",
+		int64(firstScrub["high_watermark"].(float64)) >= patrolID)
+	cleanCount := firstScrub["chunks_clean"].(float64)
+	check("每个块都有流式摘要结果（chunks_clean>0，逐块 SHA256 校验）", cleanCount > 0)
+	badBaseline := int64(firstScrub["chunks_bad"].(float64))
+	snaps := firstScrub["snapshots"].([]any)
+	allClean := true
+	var sawExcludedFailed bool
+	for _, x := range snaps {
+		m := x.(map[string]any)
+		if m["commit_status"] == "committed" && m["covered"] == true && m["integrity"] != "clean" {
+			allClean = false
+		}
+		if m["commit_status"] == "failed" && m["integrity"] == "excluded" {
+			sawExcludedFailed = true
+		}
+	}
+	check("水位内已提交快照全部 clean（历史 committed 事实不变，巡检状态独立呈现）", allClean)
+	check("既有 failed 快照单独标为 excluded，不被算作 clean、原有故障记录不变", sawExcludedFailed)
+	sd := get(srv.URL + fmt.Sprintf("/v1/scrubs/%d/snapshots/%d",
+		int64(firstScrub["run_id"].(float64)), patrolID))
+	check("按快照查询巡检状态：committed 快照返回 clean + 已扫描块数",
+		sd["integrity"] == "clean" && int64(sd["chunks_scanned"].(float64)) > 0)
+
+	// Pick a chunk shared at app.log by snapshot #2 and the patrol baseline
+	// snapshot (snapshots #1/#2/#8 all contain the same big file).
+	sharedDigest := pickSharedChunk(srv.URL, secondID, patrolID, "app.log")
+	if sharedDigest == "" {
+		must(fmt.Errorf("could not find an app.log chunk shared by snapshots %d and %d", secondID, patrolID))
+	}
+	affectedBefore := get(srv.URL + fmt.Sprintf("/v1/scrubs/%d/chunks/%s/affected",
+		int64(firstScrub["run_id"].(float64)), sharedDigest))
+	check("健康块反查：result=ok、healthy=true、能列出引用它的快照",
+		affectedBefore["result"] == "ok" && affectedBefore["healthy"] == true &&
+			len(affectedBefore["affected_snapshot_ids"].([]any)) >= 2)
+
+	// 8b. silently corrupt the shared blob on disk (same length -> rot, not truncation)
+	corruptChunkOnDisk(repoDir, sharedDigest)
+
+	// Restore BEFORE the second patrol: streaming verification still catches it.
+	code, body = raw("POST", fmt.Sprintf("%s/v1/snapshots/%d/restore", srv.URL, secondID),
+		map[string]any{"target": filepath.Join(work, "streaming-gate")})
+	fmt.Printf("  恢复时逐块流式校验 -> HTTP %d %s\n", code, body["error"])
+	check("未巡检时恢复仍由流式 SHA256 兜底拦截", code >= 400)
+	if _, err := os.Lstat(filepath.Join(work, "streaming-gate")); !os.IsNotExist(err) {
+		check("被拦截的恢复不留半成品目录", false)
+	} else {
+		check("被拦截的恢复不留半成品目录", true)
+	}
+
+	// 8c. second patrol discovers the rot and attributes it to every snapshot
+	code, body = raw("POST", srv.URL+"/v1/scrubs", map[string]any{})
+	check("再次启动巡检是新作业（不重复旧报告）", code == http.StatusCreated)
+	secondScrub := waitScrub(srv.URL)
+	run2 := int64(secondScrub["run_id"].(float64))
+	// The patrol baseline was healthy apart from the failpoint blob of the
+	// section-5 failed snapshot (unique to it); the shared blob just tampered
+	// with adds exactly one bad chunk to whatever the baseline reported.
+	check(fmt.Sprintf("损坏共享块后巡检 chunks_bad = 基线 %d + 1", badBaseline),
+		int64(secondScrub["chunks_bad"].(float64)) == badBaseline+1)
+	var suspectCommitted []int64
+	for _, x := range secondScrub["snapshots"].([]any) {
+		m := x.(map[string]any)
+		if m["commit_status"] == "committed" && m["integrity"] == "suspect" {
+			suspectCommitted = append(suspectCommitted, int64(m["snapshot_id"].(float64)))
+		}
+	}
+	fmt.Printf("  巡检标记 suspect 的已提交快照: %v\n", suspectCommitted)
+	check("共享块损坏后，引用它的多个已提交快照全部被标为 suspect", len(suspectCommitted) >= 2)
+	check("第 5 步的 failed 快照仍是 excluded，不会因为引用坏块就改判历史", func() bool {
+		f := get(srv.URL + fmt.Sprintf("/v1/scrubs/%d/snapshots/%d", run2, interruptedID))
+		return f["integrity"] == "excluded" && f["commit_status"] == "failed"
+	}())
+
+	// Reverse-lookup via the manifest lists every snapshot + file path.
+	aff := get(srv.URL + fmt.Sprintf("/v1/scrubs/%d/chunks/%s/affected", run2, sharedDigest))
+	refSnaps := aff["affected_snapshot_ids"].([]any)
+	refPaths := aff["references"].([]any)
+	fmt.Printf("  清单反查: 块 %s… 被 %d 个快照、%d 条 文件路径 引用\n",
+		sharedDigest[:12], len(refSnaps), len(refPaths))
+	check("反查结果为 digest_mismatch / healthy=false",
+		aff["result"] == "digest_mismatch" && aff["healthy"] == false)
+	sawAppLog := false
+	for _, x := range refPaths {
+		if x.(map[string]any)["rel_path"] == "app.log" {
+			sawAppLog = true
+		}
+	}
+	check("反查列出了所有受影响文件路径（包含 app.log）", sawAppLog)
+	// Every committed referencing snapshot must be suspect; every suspect
+	// committed snapshot must show up in the reference list.
+	refSet := map[int64]bool{}
+	for _, x := range refSnaps {
+		refSet[int64(x.(float64))] = true
+	}
+	suspectSet := map[int64]bool{}
+	for _, id := range suspectCommitted {
+		suspectSet[id] = true
+	}
+	lookupAgrees := true
+	for id := range suspectSet {
+		if !refSet[id] {
+			lookupAgrees = false
+		}
+	}
+	for _, x := range secondScrub["snapshots"].([]any) {
+		m := x.(map[string]any)
+		id := int64(m["snapshot_id"].(float64))
+		if m["commit_status"] == "committed" && refSet[id] && m["integrity"] != "suspect" {
+			lookupAgrees = false
+		}
+	}
+	check("反查快照集合与 suspect 判定完全一致（excluded 的 failed 快照单列）", lookupAgrees)
+
+	// Known-suspect restore must be refused BEFORE streaming, with locators.
+	for _, sid := range []int64{suspectCommitted[0], suspectCommitted[1]} {
+		code, body = raw("POST", fmt.Sprintf("%s/v1/snapshots/%d/restore", srv.URL, sid),
+			map[string]any{"target": filepath.Join(work, fmt.Sprintf("suspect-%d", sid))})
+		fmt.Printf("  恢复已知 suspect 快照 %d -> HTTP %d %s\n", sid, code, body["error"])
+		if code != http.StatusConflict || body["error"] != "snapshot_suspect" {
+			check(fmt.Sprintf("快照 %d 恢复被提前拒绝 (409 snapshot_suspect)", sid), false)
+		} else {
+			check(fmt.Sprintf("快照 %d 恢复被提前拒绝 (409 snapshot_suspect)", sid), true)
+		}
+		chunks := body["affected_chunks"].([]any)
+		namesChunk := false
+		for _, c := range chunks {
+			cm := c.(map[string]any)
+			if cm["chunk_digest"] != sharedDigest || cm["expected_blob_path"] == "" {
+				continue
+			}
+			for _, rp := range cm["rel_paths"].([]any) {
+				if rp == "app.log" {
+					namesChunk = true
+				}
+			}
+		}
+		check("拒绝错误可定位：给出摘要、rel_paths 与期望磁盘路径", namesChunk)
+	}
+
+	// 8d. interrupt + resume equivalence
+	section(8, "巡检中断：停在第一个块之前后重启巡检，结果与一次完整巡检一致、不重复报告")
+	// gate_ms blocks the patrol before its first chunk: a deterministic
+	// "slow disk" barrier that makes the interrupt reproducible.
+	code, body = raw("POST", srv.URL+"/v1/scrubs", map[string]any{"gate_ms": 400})
+	if code != http.StatusCreated {
+		must(fmt.Errorf("gated scrub start: %d %v", code, body))
+	}
+	interRun := int64(body["progress"].(map[string]any)["run_id"].(float64))
+	waitUntilScrubRunning(srv.URL, interRun)
+	// Zero chunks checkpointed yet — interrupt from the very first cursor.
+	early := get(srv.URL + fmt.Sprintf("/v1/scrubs/%d", interRun))
+	check("栅栏内巡检已在运行但尚未扫出任何块（chunks_scanned=0）",
+		early["running"] == true && int64(early["chunks_scanned"].(float64)) == 0)
+	// A second start while running must be refused rather than duplicating.
+	code, body = raw("POST", srv.URL+"/v1/scrubs", map[string]any{})
+	check("巡检进行中再次启动 -> 409 scrub_running（不生成重复作业）",
+		code == http.StatusConflict && body["error"] == "scrub_running")
+	code, _ = raw("POST", srv.URL+"/v1/scrubs/interrupt", nil)
+	check("巡检进行中可请求中断 (200)", code == http.StatusOK)
+	waitUntilScrubIdle(srv.URL, interRun)
+	mid := get(srv.URL + fmt.Sprintf("/v1/scrubs/%d", interRun))
+	check("中断后作业仍为 running，稳定游标已保存（本例为起点，可续扫）",
+		mid["status"] == "running")
+	partialScanned := int64(mid["chunks_scanned"].(float64))
+	partiallyCovered := 0
+	for _, x := range mid["snapshots"].([]any) {
+		m := x.(map[string]any)
+		if m["covered"] == true && m["commit_status"] == "committed" && m["integrity"] == "unscanned" {
+			partiallyCovered++
+		}
+	}
+	check("尚未扫描的数据不会被误标 clean（覆盖快照全部呈现 unscanned）", partiallyCovered > 0)
+
+	code, body = raw("POST", srv.URL+"/v1/scrubs", map[string]any{})
+	check("重启巡检复用同一作业（200 resumed，run_id 不变）",
+		code == http.StatusOK && body["action"] == "resumed" &&
+			int64(body["progress"].(map[string]any)["run_id"].(float64)) == interRun)
+	resumedRun := waitScrub(srv.URL)
+	check("续扫完成后 done：扫描块数=工作集块数，bad 块数与完整巡检一致",
+		resumedRun["status"] == "done" &&
+			int64(resumedRun["chunks_scanned"].(float64)) == int64(resumedRun["chunks_total"].(float64)) &&
+			int64(resumedRun["chunks_bad"].(float64)) == badBaseline+1)
+	check("从稳定游标之后继续：最终已扫描数大于中断点（0）",
+		int64(resumedRun["chunks_scanned"].(float64)) > partialScanned)
+	// Snapshot verdicts after resume must match the uninterrupted run 2.
+	resumeAgrees := true
+	for _, sid := range suspectCommitted {
+		d := get(srv.URL + fmt.Sprintf("/v1/scrubs/%d/snapshots/%d", interRun, sid))
+		if d["integrity"] != "suspect" {
+			resumeAgrees = false
+		}
+	}
+	check("中断续扫的快照结论与一次完整巡检一致（suspect 集合相同）", resumeAgrees)
+
+	// Repair the tampered blob (flip the bytes back) so the next section can
+	// show a clean patrol; the content store is content-addressed and the
+	// blob is immutable by convention, so this is an explicit repair action.
+	flipChunkOnDisk(repoDir, sharedDigest)
+
+	// ---- 9. high-watermark: snapshots born during a patrol ---------------
+	section(9, "开始水位之后才提交的快照：明确标为 uncovered，绝不假装已检查")
+	// Launch a patrol gated before its first chunk; while it waits, commit a
+	// brand-new snapshot. The barrier makes the "committed after the patrol
+	// started" ordering deterministic instead of racing disk speed.
+	code, body = raw("POST", srv.URL+"/v1/scrubs", map[string]any{"gate_ms": 600})
+	if code != http.StatusCreated {
+		must(fmt.Errorf("watermark scrub start: %d %v", code, body))
+	}
+	wmRun := int64(body["progress"].(map[string]any)["run_id"].(float64))
+	waitUntilScrubRunning(srv.URL, wmRun)
+	// Drop the escaping symlink from section 6 so this snapshot restores
+	// cleanly; the point here is watermark coverage, not link containment.
+	_ = os.Remove(filepath.Join(src, "evil_link"))
+	must(os.WriteFile(filepath.Join(src, "late.txt"), []byte("born after patrol start\n"), 0o644))
+	late := post(srv.URL+"/v1/snapshots", map[string]any{"root": src, "message": "committed during patrol"})
+	lateID := int64(late["snapshot_id"].(float64))
+	check("巡检期间新建快照不受影响，照常 committed", late["status"] == "committed")
+	waitScrub(srv.URL)
+	wmSnap := get(srv.URL + fmt.Sprintf("/v1/scrubs/%d/snapshots/%d", wmRun, lateID))
+	fmt.Printf("  晚于水位提交的快照 %d -> covered=%v integrity=%s\n",
+		lateID, wmSnap["covered"], wmSnap["integrity"])
+	check("水位后快照标为 uncovered（而不是 clean/unscanned 含糊处理）",
+		wmSnap["covered"] == false && wmSnap["integrity"] == "uncovered")
+	// uncovered is not suspect: restore remains governed by streaming checks.
+	code, body = raw("POST", fmt.Sprintf("%s/v1/snapshots/%d/restore", srv.URL, lateID),
+		map[string]any{"target": filepath.Join(work, "late-out")})
+	check("uncovered 快照不是 suspect，恢复照常工作（流式校验兜底）", code == http.StatusCreated)
+	// A later patrol covers it (the repaired shared blob verifies again).
+	nextScrub := waitScrubAfterStart(srv.URL, map[string]any{})
+	lateInNext := get(srv.URL + fmt.Sprintf("/v1/scrubs/%d/snapshots/%d",
+		int64(nextScrub["run_id"].(float64)), lateID))
+	check("下一次巡检覆盖该快照：covered=true 且 clean",
+		lateInNext["covered"] == true && lateInNext["integrity"] == "clean")
+	// And the repaired shared blob returns the two reference snapshots to clean.
+	bothRepaired := true
+	for _, sid := range suspectCommitted {
+		d := get(srv.URL + fmt.Sprintf("/v1/scrubs/%d/snapshots/%d",
+			int64(nextScrub["run_id"].(float64)), sid))
+		if d["integrity"] != "clean" {
+			bothRepaired = false
+		}
+	}
+	check("修复共享块后，受影响快照在下一次巡检中恢复 clean", bothRepaired)
+
 	// final listing
-	section(0, "快照总览")
+	section(0, "快照总览（status 是历史提交事实；integrity 是最近一次巡检的独立状态）")
 	list := get(srv.URL + "/v1/snapshots")["snapshots"].([]any)
 	for _, x := range list {
 		m := x.(map[string]any)
-		fmt.Printf("  #%-3v %-10s files=%-3v bytes=%-7v %s\n",
-			m["id"], m["status"], m["file_count"], m["bytes_total"], m["message"])
+		fmt.Printf("  #%-3v %-10s integrity=%-10v files=%-3v %s\n",
+			m["id"], m["status"], m["integrity"], m["file_count"], m["message"])
 	}
 	srv.Close()
 
@@ -374,6 +638,115 @@ func section(n int, title string) {
 		return
 	}
 	fmt.Printf("\n── %d. %s ──────────────────────────────\n", n, title)
+}
+
+// waitScrub polls the latest patrol until it finishes.
+func waitScrub(base string) map[string]any {
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		b := get(base + "/v1/scrubs/latest")
+		if b["status"] == "done" && b["running"] == false {
+			return b
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	must(fmt.Errorf("scrub never finished"))
+	return nil
+}
+
+// waitScrubAfterStart starts a patrol and waits for it to finish.
+func waitScrubAfterStart(base string, req map[string]any) map[string]any {
+	code, b := raw("POST", base+"/v1/scrubs", req)
+	if code != http.StatusCreated && code != http.StatusOK {
+		must(fmt.Errorf("scrub start: %d %v", code, b))
+	}
+	return waitScrub(base)
+}
+
+// waitUntilScrubRunning blocks until the patrol goroutine is active. With
+// gate_ms the run is guaranteed mid-barrier (zero chunks checkpointed yet),
+// which is the strongest interrupt case.
+func waitUntilScrubRunning(base string, runID int64) {
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		b := get(base + fmt.Sprintf("/v1/scrubs/%d", runID))
+		if b["running"] == true {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	must(fmt.Errorf("scrub %d never started", runID))
+}
+
+// waitUntilScrubIdle blocks until the run's in-process goroutine is gone.
+func waitUntilScrubIdle(base string, runID int64) {
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		b := get(base + fmt.Sprintf("/v1/scrubs/%d", runID))
+		if b["running"] == false {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	must(fmt.Errorf("scrub %d never went idle after interrupt", runID))
+}
+
+// pickSharedChunk finds a chunk digest referenced at relPath by both
+// snapshots — the classic "one blob shared by two backups at the same file".
+func pickSharedChunk(base string, a, b int64, relPath string) string {
+	ca := chunkDigestSetAt(base, a, relPath)
+	cb := chunkDigestSetAt(base, b, relPath)
+	for d := range cb {
+		if ca[d] {
+			return d
+		}
+	}
+	return ""
+}
+
+func chunkDigestSetAt(base string, snapID int64, relPath string) map[string]bool {
+	b := get(base + fmt.Sprintf("/v1/snapshots/%d/chunks", snapID))
+	out := map[string]bool{}
+	for _, x := range b["chunks"].([]any) {
+		m := x.(map[string]any)
+		if m["rel_path"] == relPath {
+			out[m["chunk_digest"].(string)] = true
+		}
+	}
+	return out
+}
+
+func chunkDigestSet(base string, snapID int64) map[string]bool {
+	b := get(base + fmt.Sprintf("/v1/snapshots/%d/chunks", snapID))
+	out := map[string]bool{}
+	for _, x := range b["chunks"].([]any) {
+		out[x.(map[string]any)["chunk_digest"].(string)] = true
+	}
+	return out
+}
+
+// chunkBlobPath reproduces <repo>/chunks/ab/cdef... for a hex digest.
+func chunkBlobPath(repoDir, digestHex string) string {
+	return filepath.Join(repoDir, "chunks", digestHex[:2], digestHex[2:])
+}
+
+// corruptChunkOnDisk flips every byte of a blob in place (0444 -> writable),
+// simulating silent bit-rot without changing length.
+func corruptChunkOnDisk(repoDir, digestHex string) {
+	flipChunkOnDisk(repoDir, digestHex)
+}
+
+// flipChunkOnDisk toggles all bytes of a blob; calling it twice restores the
+// original content (self-inverse repair used by the demo).
+func flipChunkOnDisk(repoDir, digestHex string) {
+	p := chunkBlobPath(repoDir, digestHex)
+	data, err := os.ReadFile(p)
+	must(err)
+	must(os.Chmod(p, 0o644))
+	for i := range data {
+		data[i] ^= 0xff
+	}
+	must(os.WriteFile(p, data, 0o644))
 }
 
 func check(name string, ok bool) {
