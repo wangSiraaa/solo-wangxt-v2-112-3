@@ -39,6 +39,9 @@ type Engine struct {
 	Fail     Failpoints
 
 	mu sync.Mutex // serializes snapshots: scan + commit is one critical section
+
+	scrubMu sync.Mutex   // guards scrub below
+	scrub   *activeScrub // non-nil while a scrub worker runs in this process
 }
 
 // NewEngine opens an engine, loading the repository's chunking polynomial
@@ -297,6 +300,13 @@ func (e *Engine) Restore(snapshotID int64, target string) (*RestoreResult, error
 	if info.Status != repo.StatusCommitted {
 		return nil, fmt.Errorf("snapshot %d is %s, only committed snapshots can be restored",
 			snapshotID, info.Status)
+	}
+
+	// Early, locatable refusal: if the most recent integrity scrub proved a
+	// referenced chunk corrupt/missing, do not start writing a half tree —
+	// name every bad chunk, its disk path and all affected snapshots/paths.
+	if err := e.GuardSuspectSnapshot(snapshotID); err != nil {
+		return nil, err
 	}
 
 	target, err = filepath.Abs(filepath.FromSlash(target))

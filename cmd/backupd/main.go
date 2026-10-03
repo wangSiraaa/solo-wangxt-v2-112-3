@@ -56,6 +56,19 @@ func main() {
 		}
 	}
 
+	// A scrub killed mid-run (paused, or a "running" row left by a crashed
+	// process) resumes from its stable cursor; no chunk report is redone.
+	if sc, err := engine.LatestScrubRow(); err != nil {
+		log.Printf("startup scrub check: %v", err)
+	} else if sc != nil {
+		if _, err := engine.StartScrub(false, backup.ScrubHooks{}); err != nil {
+			log.Printf("startup scrub resume: %v", err)
+		} else {
+			log.Printf("startup scrub resume: scrub %d continuing from chunk %d/%d",
+				sc.ID, sc.ScannedChunks, sc.TotalChunks)
+		}
+	}
+
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatalf("listen %s: %v", *addr, err)

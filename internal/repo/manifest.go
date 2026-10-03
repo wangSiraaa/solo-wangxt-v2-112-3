@@ -120,6 +120,66 @@ CREATE TABLE IF NOT EXISTS meta (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 );
+
+-- Repository-wide integrity scrubs. A scrub has a start watermark
+-- (high_snapshot_id): only snapshots with id <= the watermark that were
+-- already committed at start are in scope. Snapshots committed afterwards
+-- stay "uncovered" by this scrub and can never be labelled clean by it.
+-- The scrub never writes snapshots.status: the committed/pending/failed fact
+-- is immutable history; the scrub verdict lives separately in scrub_snapshots.
+CREATE TABLE IF NOT EXISTS scrubs (
+	id               INTEGER PRIMARY KEY AUTOINCREMENT,
+	status           TEXT    NOT NULL,         -- running | paused | done
+	high_snapshot_id INTEGER NOT NULL,        -- start watermark
+	total_chunks     INTEGER NOT NULL DEFAULT 0,
+	scanned_chunks   INTEGER NOT NULL DEFAULT 0,
+	bad_chunks       INTEGER NOT NULL DEFAULT 0,
+	bytes_scanned    INTEGER NOT NULL DEFAULT 0,
+	started_at       TEXT    NOT NULL,
+	paused_at        TEXT,
+	finished_at      TEXT,
+	last_error       TEXT    NOT NULL DEFAULT ''
+);
+
+-- Frozen scan queue created once at scrub start. It is the stable cursor:
+-- chunks are processed in digest order, and resume simply continues with
+-- done=0 rows. New snapshots committing during the scrub insert new chunk
+-- rows elsewhere but never enter this queue, so the job's scope is fixed.
+CREATE TABLE IF NOT EXISTS scrub_queue (
+	scrub_id     INTEGER NOT NULL REFERENCES scrubs(id) ON DELETE CASCADE,
+	chunk_digest BLOB    NOT NULL,
+	done         INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (scrub_id, chunk_digest)
+);
+CREATE INDEX IF NOT EXISTS idx_sq_next ON scrub_queue(scrub_id, done, chunk_digest);
+
+-- Per-chunk streaming digest verdict. One row per queued chunk, upserted
+-- (never duplicated) if an interrupted batch is redone after resume.
+CREATE TABLE IF NOT EXISTS scrub_chunks (
+	scrub_id        INTEGER NOT NULL REFERENCES scrubs(id) ON DELETE CASCADE,
+	chunk_digest    BLOB    NOT NULL,
+	result          TEXT    NOT NULL,          -- ok | bad | missing
+	declared_length INTEGER NOT NULL,          -- chunks.length, -1 when catalog row absent
+	observed_length INTEGER NOT NULL,          -- bytes streamed, -1 when unreadable/missing
+	observed_digest BLOB,                      -- streamed SHA-256 when it could be computed
+	detail          TEXT    NOT NULL DEFAULT '',
+	scanned_at      TEXT    NOT NULL,
+	PRIMARY KEY (scrub_id, chunk_digest)
+);
+
+-- Independent per-snapshot integrity verdict of one scrub.
+--   unscanned: in scope, referenced chunks not fully processed yet
+--   clean:     every referenced chunk streamed ok
+--   suspect:   >=1 referenced chunk bad/missing
+--   excluded:  pending/failed at the watermark (never re-labelled clean here)
+CREATE TABLE IF NOT EXISTS scrub_snapshots (
+	scrub_id    INTEGER NOT NULL REFERENCES scrubs(id) ON DELETE CASCADE,
+	snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+	status      TEXT    NOT NULL,
+	bad_chunks  INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (scrub_id, snapshot_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ss_snap ON scrub_snapshots(snapshot_id, scrub_id);
 `
 
 func (m *Manifest) migrate() error {

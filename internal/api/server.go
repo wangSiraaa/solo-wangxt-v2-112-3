@@ -30,7 +30,14 @@ func (s *Server) NewRouter() http.Handler {
 	mux.HandleFunc("POST /v1/snapshots/{id}/verify", s.verify)
 	mux.HandleFunc("GET /v1/snapshots/{id}/errors", s.listErrors)
 	mux.HandleFunc("GET /v1/snapshots/{id}/missing", s.missing)
+	mux.HandleFunc("GET /v1/snapshots/{id}/integrity", s.snapshotIntegrity)
 	mux.HandleFunc("POST /v1/snapshots/{id}/restore", s.restore)
+	mux.HandleFunc("POST /v1/scrubs", s.startScrub)
+	mux.HandleFunc("GET /v1/scrubs", s.listScrubs)
+	mux.HandleFunc("GET /v1/scrubs/{id}", s.getScrub)
+	mux.HandleFunc("POST /v1/scrubs/{id}/cancel", s.cancelScrub)
+	mux.HandleFunc("GET /v1/scrubs/{id}/snapshots", s.scrubSnapshots)
+	mux.HandleFunc("GET /v1/scrubs/{id}/affected", s.scrubAffected)
 	return mux
 }
 
@@ -67,6 +74,12 @@ type snapshotResp struct {
 	CreatedAt   time.Time  `json:"created_at"`
 	CommittedAt *time.Time `json:"committed_at,omitempty"`
 	Message     string     `json:"message"`
+	// Integrity verdict from the most recent scrub. ScrubStatus is
+	// independent of Status: a snapshot stays "committed" (its commit-time
+	// fact) even when a later scrub finds it "suspect".
+	ScrubID     int64  `json:"scrub_id,omitempty"`
+	ScrubStatus string `json:"integrity_status,omitempty"`
+	ScrubBad    int64  `json:"integrity_bad_chunks,omitempty"`
 }
 
 func toSnapshotResp(si repo.SnapshotInfo) snapshotResp {
@@ -86,6 +99,21 @@ func toSnapshotResp(si repo.SnapshotInfo) snapshotResp {
 	}
 }
 
+// withIntegrity fills the scrub-verdict fields on snapshot responses.
+func (s *Server) withIntegrity(out []snapshotResp) {
+	views, err := s.Engine.Manifest.IntegrityViews()
+	if err != nil {
+		return // status/history remain valid without integrity decoration
+	}
+	for i := range out {
+		if v, ok := views[out[i].ID]; ok {
+			out[i].ScrubID = v.ScrubID
+			out[i].ScrubStatus = v.Status
+			out[i].ScrubBad = v.BadChunks
+		}
+	}
+}
+
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 	all, err := s.Engine.Manifest.ListSnapshots()
 	if err != nil {
@@ -96,6 +124,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 	for _, si := range all {
 		out = append(out, toSnapshotResp(si))
 	}
+	s.withIntegrity(out)
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": out})
 }
 
@@ -182,7 +211,15 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
 		return
 	}
-	writeJSON(w, http.StatusOK, toSnapshotResp(si))
+	resp := toSnapshotResp(si)
+	if views, verr := s.Engine.Manifest.IntegrityViews(); verr == nil {
+		if v, ok := views[id]; ok {
+			resp.ScrubID = v.ScrubID
+			resp.ScrubStatus = v.Status
+			resp.ScrubBad = v.BadChunks
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) verify(w http.ResponseWriter, r *http.Request) {
@@ -310,6 +347,18 @@ func (s *Server) restore(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.Engine.Restore(id, req.Target)
 	if err != nil {
+		var suspect *backup.SuspectError
+		if errors.As(err, &suspect) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"snapshot_id": suspect.SnapshotID,
+				"scrub_id":    suspect.ScrubID,
+				"error":       "snapshot_suspect",
+				"message":     err.Error(),
+				"bad_chunks":  suspect.Details,
+				"hint":        "GET /v1/scrubs/" + strconv.FormatInt(suspect.ScrubID, 10) + "/affected",
+			})
+			return
+		}
 		if errors.Is(err, backup.ErrTargetExists) {
 			writeErr(w, http.StatusConflict, "target_exists", err.Error(), nil)
 			return

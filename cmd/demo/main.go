@@ -8,12 +8,16 @@
 //  5. commit interruption losing a blob -> failed snapshot with the exact
 //     missing chunk located,
 //  6. symlink escaping the root -> restored link is blocked,
-//  7. server restart with a pending snapshot -> startup recovery commits it.
+//  7. server restart with a pending snapshot -> startup recovery commits it,
+//  8. repository-wide integrity scrub: a silently corrupted shared blob is
+//     found, every referencing snapshot/path is listed and suspect restore
+//     is refused up front; an unaffected snapshot still restores.
 package main
 
 import (
 	"bytes"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -30,6 +34,8 @@ import (
 	"incbackup/internal/api"
 	"incbackup/internal/backup"
 	"incbackup/internal/repo"
+
+	_ "modernc.org/sqlite"
 )
 
 var pass, fail int
@@ -274,13 +280,142 @@ func main() {
 	fmt.Printf("  重启后: 快照 %d status=%s\n", pendID, si["status"])
 	check("重启恢复把 pending 快照验证后提交为 committed", si["status"] == "committed")
 
+	// ---- 8. repository-wide integrity scrub -------------------------------
+	section(8, "全仓完整性巡检：静默损坏的共享块主动暴露，受影响快照与路径全部列出，恢复提前拒绝")
+
+	// 8a. Build a separate, healthy snapshot sharing no chunk with the
+	// corrupted source, to prove damage to one blob does not poison
+	// unrelated snapshots.
+	other := filepath.Join(work, "other-src")
+	must(os.MkdirAll(other, 0o755))
+	must(os.WriteFile(filepath.Join(other, "clean.txt"),
+		[]byte(strings.Repeat("totally different bytes here\n", 2000)), 0o644))
+	otherSnap := post(srv.URL+"/v1/snapshots", map[string]any{"root": other, "message": "unrelated healthy tree"})
+	otherID := int64(otherSnap["snapshot_id"].(float64))
+	check("无关目录的快照正常 committed", otherSnap["status"] == "committed")
+
+	// The two app.log snapshots (firstID, secondID) share the great majority
+	// of their chunks. Pick one such shared digest straight from the manifest.
+	ro, err := sql.Open("sqlite", "file:"+filepath.Join(repoDir, "manifest.sqlite")+"?mode=ro")
+	must(err)
+	var sharedHex string
+	must(ro.QueryRow(`SELECT hex(ec1.chunk_digest) FROM entry_chunks ec1
+		JOIN entry_chunks ec2 ON ec2.chunk_digest = ec1.chunk_digest
+		WHERE ec1.snapshot_id = ? AND ec2.snapshot_id = ?
+			AND ec1.rel_path = 'app.log'
+		GROUP BY ec1.chunk_digest LIMIT 1`, firstID, secondID).Scan(&sharedHex))
+	ro.Close()
+	sharedHex = strings.ToLower(sharedHex) // SQLite hex() is uppercase; store layout is lowercase
+	blob := filepath.Join(repoDir, "chunks", sharedHex[:2], sharedHex[2:])
+	must(os.Chmod(blob, 0o644)) // blobs ship 0444
+	must(os.WriteFile(blob, []byte("SILENT-BIT-ROT-ON-DISK!!!"), 0o644))
+	fmt.Printf("  被静默篡改的共享块: %s…（被快照 %d 和 %d 共同引用）\n", sharedHex[:16], firstID, secondID)
+
+	// The historical status stays committed: that fact is never rewritten.
+	si = get(srv.URL + fmt.Sprintf("/v1/snapshots/%d", firstID))
+	check("巡检前：snapshots.status 仍是 committed（历史提交事实不被改写）", si["status"] == "committed")
+
+	// Start the scrub and wait for it to finish.
+	code, body = raw("POST", srv.URL+"/v1/scrubs", nil)
+	fmt.Printf("  POST /v1/scrubs -> HTTP %d, scrub %v status=%v\n", code, body["id"], body["status"])
+	check("启动巡检返回 202", code == http.StatusAccepted)
+	scrubID := int64(body["id"].(float64))
+	scrubDeadline := time.Now().Add(10 * time.Second)
+	var final map[string]any
+	for time.Now().Before(scrubDeadline) {
+		final = get(srv.URL + fmt.Sprintf("/v1/scrubs/%d", scrubID))
+		if final["status"] == "done" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	fmt.Printf("  巡检进度: 水位=%v 块=%v/%v 坏块=%v 字节=%v status=%v\n",
+		final["watermark"], final["scanned_chunks"], final["total_chunks"],
+		final["bad_chunks"], final["bytes_scanned"], final["status"])
+	check("巡检完成 status=done，bad_chunks=1", final["status"] == "done" &&
+		int64(final["bad_chunks"].(float64)) == 1)
+
+	// Both sharing snapshots are suspect; the unrelated snapshot is clean.
+	verdicts := get(srv.URL + fmt.Sprintf("/v1/scrubs/%d/snapshots", scrubID))["snapshots"].([]any)
+	verdictOf := map[int64]map[string]any{}
+	for _, x := range verdicts {
+		m := x.(map[string]any)
+		verdictOf[int64(m["snapshot_id"].(float64))] = m
+	}
+	check("共享损坏块的快照 "+fmt.Sprint(firstID)+" 被标为 suspect",
+		verdictOf[firstID]["integrity"] == "suspect")
+	check("共享损坏块的快照 "+fmt.Sprint(secondID)+" 被标为 suspect",
+		verdictOf[secondID]["integrity"] == "suspect")
+	check("无关节点的快照 "+fmt.Sprint(otherID)+" 仍是 clean",
+		verdictOf[otherID]["integrity"] == "clean")
+
+	// Reverse lookup: one digest -> every affected snapshot and file path.
+	aff := get(srv.URL + fmt.Sprintf("/v1/scrubs/%d/affected", scrubID))
+	bads, _ := aff["bad_chunks"].([]any)
+	fmt.Printf("  清单反查: %d 个坏块\n", len(bads))
+	sawBoth, sawPath := false, false
+	for _, x := range bads {
+		m := x.(map[string]any)
+		fmt.Printf("    块 %s… result=%v 磁盘=%s\n",
+			m["chunk_digest"].(string)[:16], m["result"], m["blob_path"])
+		owners := map[int64]bool{}
+		for _, a := range m["affected"].([]any) {
+			am := a.(map[string]any)
+			sid := int64(am["snapshot_id"].(float64))
+			owners[sid] = true
+			fmt.Printf("      -> 快照 %v 文件 %s\n", sid, am["rel_path"])
+			if am["rel_path"] == "app.log" {
+				sawPath = true
+			}
+		}
+		if owners[firstID] && owners[secondID] {
+			sawBoth = true
+		}
+	}
+	check("反查同时列出两个受影响快照", sawBoth)
+	check("反查给出受影响文件路径 app.log", sawPath)
+
+	// Per-snapshot integrity query.
+	integ := get(srv.URL + fmt.Sprintf("/v1/snapshots/%d/integrity", firstID))
+	check("按快照查询完整性 = suspect", integ["integrity"] == "suspect")
+
+	// History is still committed; restore is refused early and locatably.
+	si = get(srv.URL + fmt.Sprintf("/v1/snapshots/%d", firstID))
+	check("巡检后 snapshots.status 仍为 committed（verdict 独立呈现）", si["status"] == "committed")
+	code, body = raw("POST", srv.URL+fmt.Sprintf("/v1/snapshots/%d/restore", firstID),
+		map[string]any{"target": filepath.Join(work, "never-suspect")})
+	fmt.Printf("  恢复 suspect 快照 -> HTTP %d %s\n", code, body["error"])
+	check("已知 suspect 的恢复在写盘前被拒绝 (409 snapshot_suspect)",
+		code == http.StatusConflict && body["error"] == "snapshot_suspect")
+	bc0, _ := body["bad_chunks"].([]any)
+	check("拒绝错误可定位：携带块摘要与磁盘路径", len(bc0) >= 1 &&
+		bc0[0].(map[string]any)["blob_path"] != "")
+
+	// The unrelated snapshot restores normally.
+	code, body = raw("POST", srv.URL+fmt.Sprintf("/v1/snapshots/%d/restore", otherID),
+		map[string]any{"target": filepath.Join(work, "other-out")})
+	check("未受影响的快照仍可正常恢复", code == http.StatusCreated)
+
+	// Snapshots after the watermark are explicitly uncovered, never clean.
+	post2 := post(srv.URL+"/v1/snapshots", map[string]any{"root": other, "message": "after scrub watermark"})
+	afterID := int64(post2["snapshot_id"].(float64))
+	verdicts2 := get(srv.URL + fmt.Sprintf("/v1/scrubs/%d/snapshots", scrubID))["snapshots"].([]any)
+	covered := ""
+	for _, x := range verdicts2 {
+		m := x.(map[string]any)
+		if int64(m["snapshot_id"].(float64)) == afterID {
+			covered = m["integrity"].(string)
+		}
+	}
+	check("水位之后才提交的快照明确标为 uncovered（不假装已检查）", covered == "uncovered")
+
 	// final listing
-	section(0, "快照总览")
+	section(0, "快照总览（status=历史提交事实，integrity=最近巡检结论，两者独立）")
 	list := get(srv.URL + "/v1/snapshots")["snapshots"].([]any)
 	for _, x := range list {
 		m := x.(map[string]any)
-		fmt.Printf("  #%-3v %-10s files=%-3v bytes=%-7v %s\n",
-			m["id"], m["status"], m["file_count"], m["bytes_total"], m["message"])
+		fmt.Printf("  #%-3v %-10v integrity=%-11v files=%-3v bytes=%-7v %s\n",
+			m["id"], m["status"], m["integrity_status"], m["file_count"], m["bytes_total"], m["message"])
 	}
 	srv.Close()
 
